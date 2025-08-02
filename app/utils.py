@@ -34,33 +34,40 @@ def get_splitter(num_pages: int) -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
 def load_pdf(path_or_url: str) -> List[Document]:
-    # Step 1: Download if URL
+    temp_download = False
+
     if path_or_url.startswith(("http://", "https://")):
-        try:
-            response = requests.get(path_or_url)
-            response.raise_for_status()
-            file_path = Path("temp.pdf")
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-        except Exception as e:
-            raise
+        response = requests.get(path_or_url)
+        response.raise_for_status()
+        file_path = Path("temp.pdf")
+        with open(file_path, "wb") as f:
+            f.write(response.content)
+        temp_download = True
     else:
         file_path = Path(path_or_url)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-    # Step 2: Load with PyPDFLoader
-    try:
-        loader = PyPDFLoader(str(file_path))
-        docs = loader.load()
-    except Exception as e:
-        raise
+    loader = PyPDFLoader(str(file_path))
+    raw_docs = loader.load()
 
-    # Step 3: Split using dynamic splitter
-    try:
-        splitter = get_splitter(num_pages=len(docs))
-        split_docs = splitter.split_documents(docs)
-    except Exception as e:
-        raise
+    splitter = get_splitter(num_pages=len(raw_docs))
+    split_docs = splitter.split_documents(raw_docs)
+
+    if temp_download:
+        os.remove(file_path)
 
     return split_docs
+
+def rerank_documents(query: str, retrieved_docs: List[Document], top_n: int = 5) -> List[Document]:
+    docs_texts = [doc.page_content for doc in retrieved_docs]
+
+    response = voyage.rerank(
+        query=query,
+        documents=docs_texts,
+        model="rerank-2"
+    )
+
+    top_results = sorted(response.results, key=lambda x: x.relevance_score, reverse=True)[:top_n]
+
+    return [retrieved_docs[result.index] for result in top_results]

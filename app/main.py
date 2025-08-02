@@ -1,5 +1,4 @@
 from dotenv import load_dotenv
-
 load_dotenv()
 
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -9,13 +8,14 @@ import requests
 import tempfile
 import os
 
-from app.utils import load_pdf  # Make sure this function returns LangChain documents
+from app.utils import load_pdf
 
 from langchain.prompts import PromptTemplate
 from langchain_weaviate import WeaviateVectorStore
-from langchain_voyageai import VoyageAIEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings, VoyageAIRerank
 from langchain.chains import RetrievalQA
 from langchain_groq import ChatGroq
+from langchain.retrievers import ContextualCompressionRetriever
 
 import weaviate
 from weaviate.classes.init import Auth
@@ -58,7 +58,10 @@ def run_query(request: QueryRequest, authorization: Optional[str] = Header(None)
         if not docs:
             raise ValueError("No content extracted from PDF")
 
-        embeddings = VoyageAIEmbeddings(model="voyage-3-large", voyage_api_key=VOYAGE_API_KEY)
+        embeddings = VoyageAIEmbeddings(
+            model="voyage-3-large",
+            voyage_api_key=VOYAGE_API_KEY
+        )
 
         vectorstore = WeaviateVectorStore(
             client=client,
@@ -69,6 +72,18 @@ def run_query(request: QueryRequest, authorization: Optional[str] = Header(None)
 
         vectorstore.add_documents(docs)
 
+        # ⚡ Add Voyage Reranker 2 here
+        reranker = VoyageAIRerank(
+            voyage_api_key=VOYAGE_API_KEY,
+            model="rerank-2"  # You can also use "rerank-2-lite" if needed
+        )
+
+        # 🎯 Wrap retriever with contextual compression (reranking)
+        retriever = ContextualCompressionRetriever(
+            base_compressor=reranker,
+            base_retriever=vectorstore.as_retriever()
+        )
+
         map_template = """You are analyzing an insurance policy document. Based on the following context, extract any information relevant to the question. If no relevant information is found, respond with "No relevant information found."
 
 Context:
@@ -78,14 +93,9 @@ Question: {question}
 
 Relevant information:"""
 
-        map_prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template=map_template
-        )
+        reduce_template = """You are a helpful assistant answering questions strictly based on the provided insurance policy document.
 
-        reduce_template = """You are a helpful assistant answering questions based strictly on the provided insurance policy document.
-
-Based on the following extracted information from different parts of the document, provide a direct and factual answer to the question. Do not say things like "according to the context." If the answer is not found, reply: "Not mentioned in the policy document."
+Based on the following extracted information from different parts of the document, provide a direct and factual answer to the question. If the answer is not found, reply: "Not mentioned in the policy document."
 
 Use no more than 2 sentences.
 
@@ -95,6 +105,11 @@ Extracted information:
 Question: {question}
 
 Answer:"""
+
+        map_prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template=map_template
+        )
 
         reduce_prompt = PromptTemplate(
             input_variables=["summaries", "question"],
@@ -107,7 +122,7 @@ Answer:"""
                 model_name="llama3-70b-8192",
                 api_key=GROQ_API_KEY
             ),
-            retriever=vectorstore.as_retriever(),
+            retriever=retriever,
             chain_type="map_reduce",
             chain_type_kwargs={
                 "question_prompt": map_prompt,
@@ -127,19 +142,13 @@ Answer:"""
         return {"answers": answers}
 
     finally:
-
         import gc
-
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
-
         for var in ['docs', 'embeddings', 'vectorstore', 'qa', 'answers']:
-
             if var in locals():
                 del locals()[var]
-
-gc.collect()
-
+        gc.collect()
 
 @app.get("/ping")
 def ping():
