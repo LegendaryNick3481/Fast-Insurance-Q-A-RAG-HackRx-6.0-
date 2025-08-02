@@ -7,6 +7,7 @@ from typing import List, Optional
 import requests
 import tempfile
 import os
+import gc
 
 from app.utils import load_pdf
 
@@ -142,7 +143,7 @@ Answer:"""
         return {"answers": answers}
 
     finally:
-        import gc
+
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
         for var in ['docs', 'embeddings', 'vectorstore', 'qa', 'answers']:
