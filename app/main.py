@@ -127,8 +127,19 @@ Answer:"""
         return {"answers": answers}
 
     finally:
+
+        import gc
+
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
+
+        for var in ['docs', 'embeddings', 'vectorstore', 'qa', 'answers']:
+
+            if var in locals():
+                del locals()[var]
+
+gc.collect()
+
 
 @app.get("/ping")
 def ping():

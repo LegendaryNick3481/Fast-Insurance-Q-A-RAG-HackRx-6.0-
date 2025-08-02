@@ -1,6 +1,6 @@
 import requests
 
-url = "https://hackerx6-0-1.onrender.com/api/v1/hackrx/run"
+url = "https://hackrx-backend-production-b840.up.railway.app/api/v1/hackrx/run"
 headers = {
     "Authorization": "Bearer 8ad62148045cbf8137a66e1d8c0974e14f62a970b4fa91afb850f461abfbadb8",
     "Content-Type": "application/json"
