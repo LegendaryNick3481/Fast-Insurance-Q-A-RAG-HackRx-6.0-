@@ -1,7 +1,7 @@
 import requests
 
-#url = "https://hackrx-backend-production-b840.up.railway.app/api/v1/hackrx/run"
-url = "http://localhost:8080/api/v1/hackrx/run"
+url = "https://hackrx-backend-production-b840.up.railway.app/api/v1/hackrx/run"
+#url = "http://localhost:8080/api/v1/hackrx/run"
 
 headers = {
     "Authorization": "Bearer 8ad62148045cbf8137a66e1d8c0974e14f62a970b4fa91afb850f461abfbadb8",

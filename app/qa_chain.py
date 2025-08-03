@@ -128,7 +128,7 @@ async def get_qa_chain(docs: List[Document]):
     reranker = VoyageAIRerank(
         model="rerank-2",
         voyageai_api_key=os.getenv("VOYAGE_API_KEY"),
-        top_k=  min(k,5)
+        top_k=  min(k,8)
     )
 
     rerank_retriever = ContextualCompressionRetriever(
@@ -145,9 +145,11 @@ async def get_qa_chain(docs: List[Document]):
     - Waiting periods (e.g., in months or years, and when they begin)
     - Eligibility criteria (e.g., age, gender, prior coverage, continuous coverage requirements)
     - Policy limits (e.g., number of claims, amount caps, frequency restrictions)
+    - Coverage details and benefits (what is covered, excluded, or conditionally covered)
+    - Definitions of terms (e.g., hospital, medical practitioner, pre-existing diseases)
     - Legal or regulatory compliance clauses (e.g., specific acts or IRDAI references)
 
-    Avoid paraphrasing, summarizing, or making inferences. Do not include general statements or interpretations.
+    Extract specific numbers, percentages, time periods, and qualifying conditions exactly as stated.
 
     If the document does not mention anything relevant, write exactly: **"No relevant information found."**
 
@@ -163,13 +165,17 @@ async def get_qa_chain(docs: List[Document]):
     reduce_prompt = PromptTemplate(
         input_variables=["summaries", "question"],
         template="""
-    Using only the extracted facts provided below, write a concise and complete answer to the question. Maintain the formal tone and structure of an official insurance policy document.
+    Using only the extracted facts provided below, write a direct, complete answer to the question. 
 
     Your answer must:
-    - Include all relevant durations, waiting periods, eligibility criteria, and policy limits explicitly stated.
-    - Reflect any legal or regulatory language exactly as mentioned.
-    - Avoid assumptions, interpretations, or additions not present in the facts.
-    - If the answer is not found in the facts, write: **"Not mentioned in the policy document."**
+    - Be a single, comprehensive paragraph that directly answers the question
+    - Include all relevant specific details: exact time periods, percentages, amounts, conditions, and qualifying criteria
+    - Mention specific acts, regulations, or compliance requirements when relevant
+    - Use precise language from the policy document
+    - Start with a clear statement (Yes/No when applicable) followed by specific details
+    - If multiple conditions apply, list them clearly within the paragraph
+
+    If the answer is not found in the facts, write: **"Not mentioned in the policy document."**
 
     Facts:
     {summaries}
