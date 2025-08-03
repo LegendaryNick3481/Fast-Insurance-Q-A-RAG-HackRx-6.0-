@@ -92,7 +92,6 @@ class WeaviateHybridRetriever(BaseRetriever):
             print(f"Hybrid search error: {e}")
             return []
 
-
 def get_dynamic_k(page_count: int) -> int:
     if page_count <= 5:
         return 4
@@ -122,7 +121,7 @@ async def get_qa_chain(docs: List[Document]):
         weaviate_client=weaviate_client,
         index_name="Document",  # ✅ explicitly passed
         k=k,
-        alpha=0.5
+        alpha=0.3
     )
 
     reranker = VoyageAIRerank(
@@ -151,7 +150,7 @@ async def get_qa_chain(docs: List[Document]):
 
     Extract specific numbers, percentages, time periods, and qualifying conditions exactly as stated.
 
-    If the document does not mention anything relevant, write exactly: **"No relevant information found."**
+    If the document does not mention anything relevant, write exactly: "No relevant information found."
 
     Context:
     {context}
@@ -175,7 +174,7 @@ async def get_qa_chain(docs: List[Document]):
     - Start with a clear statement (Yes/No when applicable) followed by specific details
     - If multiple conditions apply, list them clearly within the paragraph
 
-    If the answer is not found in the facts, write: **"Not mentioned in the policy document."**
+    If the answer is not found in the facts, write: "Not mentioned in the policy document."
 
     Facts:
     {summaries}
