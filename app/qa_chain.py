@@ -325,8 +325,8 @@ Instructions:
 - If an exclusion applies, state it explicitly with relevant conditions.
 - The final response must be written as if advising a client: professional, confident, and precise—no robotic phrasing.
 - Do not use line breaks, bullet points, or informal language.
-- Limit the response to 1–2 complete sentences.
-- Summarize only if needed to stay within the 2-sentence limit while preserving all essential policy information.
+- Limit the response to 1–3 complete sentences.
+- Summarize only if needed to stay within the 3-sentence limit while preserving all essential policy information.
 
 Context:
 {context}
