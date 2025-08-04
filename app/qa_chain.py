@@ -313,29 +313,29 @@ async def get_ultra_fast_qa_chain(docs: List[Document], use_reranking: bool = Tr
     ultra_fast_prompt = PromptTemplate(
         input_variables=["context", "question"],
         template="""
-    Based on the insurance policy context provided, answer the question with complete accuracy and detail in maximum 2 sentences.
+Based on the insurance policy context provided, answer the client's question with complete accuracy in no more than 2 sentences.
 
-    Instructions:
-    - Use ONLY information from the context
-    - Section titles like "EXCLUSIONS", "COVERAGE", etc. are part of the context and help you understand the meaning
-    - Include specific numbers (days, months, percentages, amounts)
-    - Mention all conditions, limitations, and requirements
-    - Reference exact policy terms and definitions
-    - If coverage exists, specify eligibility criteria and limits
-    - If there are exceptions or exclusions, include them
-    - Keep response to maximum 2 sentences while including all essential details
-    - Do not use line breaks or newline characters in your response
-    - Explain it as if answering a client question, but keep it formal.
-    - Use a tone that is clear, confident, and professional, like an insurance advisor. Avoid robotic phrasing
-    - No line breaks
+Instructions:
+- Use ONLY the information from the provided context.
+- Treat section titles (e.g., EXCLUSIONS, COVERAGE, DEFINITIONS) as part of the context.
+- Include all relevant numbers (e.g., days, months, percentages, monetary limits).
+- Clearly state all applicable conditions, limitations, eligibility criteria, and exclusions.
+- Refer to defined terms in the policy exactly as they appear (e.g., “Insured Person”, “Sum Insured”, “Waiting Period”).
+- If coverage is provided, mention when and to whom it applies, with all constraints.
+- If an exclusion applies, state it explicitly with relevant conditions.
+- The final response must be written as if advising a client: professional, confident, and precise—no robotic phrasing.
+- Do not use line breaks, bullet points, or informal language.
+- Limit the response to 1–2 complete sentences.
+- Summarize only if needed to stay within the 2-sentence limit while preserving all essential policy information.
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question:
-    {question}
+Question:
+{question}
 
-    Answer concisely in 1–2 sentences, summarizing if necessary. Include all essential conditions:
+Answer:
+
     """
     )
 

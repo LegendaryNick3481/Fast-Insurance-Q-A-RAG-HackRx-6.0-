@@ -17,12 +17,49 @@ import os
 import tempfile
 import asyncio
 import re
+import traceback  # Added missing import
 from starlette.concurrency import run_in_threadpool
 from collections import defaultdict
 
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 if not VOYAGE_API_KEY:
     raise ValueError("VOYAGE_API_KEY not found in environment")
+
+# Consolidated keyword weights for easier tuning and dynamic scoring
+KEYWORD_WEIGHTS = {
+    # Critical insurance terms (weight: 5)
+    "coverage": 5, "exclusion": 5, "sum insured": 5, "premium": 5, "claim": 5,
+    "deductible": 5, "co-payment": 5, "reimbursement": 5, "cashless": 5,
+    "pre-existing disease": 5, "waiting period": 5, "grace period": 5,
+
+    # High-value policy & admin terms (weight: 4)
+    "policy": 4, "insurer": 4, "insured": 4, "policyholder": 4, "proposer": 4,
+    "schedule": 4, "endorsement": 4, "renewal": 4, "cancellation": 4, "portability": 4,
+    "migration": 4, "cumulative bonus": 4, "room rent": 4, "annexure": 4, "tpa": 4,
+    "sub-limit": 4,
+
+    # Medical coverage terms (weight: 3)
+    "hospitalization": 3, "pre-hospitalisation": 3, "post-hospitalisation": 3,
+    "in-patient": 3, "day care": 3, "surgery": 3, "icu": 3, "operation theatre": 3,
+    "medical practitioner": 3, "medical expenses": 3, "diagnostics": 3,
+    "medication": 3, "consultation": 3, "emergency": 3, "modern treatment": 3,
+    "dental treatment": 3, "cataract": 3, "ambulance": 3, "ayush": 3,
+    "immunotherapy": 3, "chemotherapy": 3, "robotic surgery": 3, "stem cell therapy": 3,
+
+    # Condition & disease terms (weight: 2)
+    "illness": 2, "injury": 2, "congenital anomaly": 2, "chronic condition": 2,
+    "acute condition": 2, "aids": 2, "cancer": 2, "hernia": 2, "arthritis": 2,
+    "hydrocele": 2, "piles": 2, "diabetes": 2, "hypertension": 2, "ulcers": 2,
+
+    # Claims processing terms (weight: 2)
+    "settlement": 2, "notification": 2, "submission": 2, "supporting documents": 2,
+    "admissible": 2, "processing": 2, "approval": 2,
+
+    # Regulatory/legal terms (weight: 2)
+    "irdai": 2, "uin": 2, "declaration": 2, "disclosure": 2, "contract": 2,
+    "condition precedent": 2, "statutory": 2, "compliance": 2
+}
+
 
 class InsuranceSectionSplitter:
     """Custom splitter that understands insurance document structure"""
@@ -36,14 +73,8 @@ class InsuranceSectionSplitter:
         r'^\s*Chapter\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',  # "Chapter 1: General Provisions"
     ]
 
-    # Critical insurance keywords that should stay together
-    CRITICAL_KEYWORDS = [
-        'exclusion', 'coverage', 'sum insured', 'premium', 'co-payment',
-        'claim', 'reimbursement', 'cashless', 'pre-existing disease',
-        'waiting period', 'grace period', 'hospitalization', 'surgery',
-        'medical expenses', 'deductible', 'sub-limit', 'cumulative bonus',
-        'room rent', 'endorsement', 'renewal', 'cancellation', 'irdai'
-    ]
+    # Critical insurance keywords that should stay together (updated to match KEYWORD_WEIGHTS)
+    CRITICAL_KEYWORDS = list(KEYWORD_WEIGHTS.keys())
 
     def __init__(self, chunk_size: int = 2500, chunk_overlap: int = 400):
         self.chunk_size = chunk_size
@@ -223,12 +254,10 @@ class InsuranceSectionSplitter:
         filtered_chunks = []
         for i, chunk in enumerate(chunks):
             if self._has_sufficient_context(chunk.page_content):
-                section_title = chunk.metadata.get("section_title", "Unknown")
                 chunk.metadata.update({
-                    "chunk_index": i,
-                    "chunk_type": "fallback_split"
+                    'chunk_index': i,
+                    'chunk_type': 'fallback_split'
                 })
-                chunk.page_content = f"Section: {section_title}\n\n{chunk.page_content}"
                 filtered_chunks.append(chunk)
 
         return filtered_chunks
@@ -255,45 +284,10 @@ def get_smart_splitter(num_pages: int) -> InsuranceSectionSplitter:
     )
 
 
-# Consolidated keyword weights for easier tuning and dynamic scoring
-KEYWORD_WEIGHTS = {
-    # Critical insurance terms (weight: 5)
-    "coverage": 5, "exclusion": 5, "sum insured": 5, "premium": 5, "claim": 5,
-    "deductible": 5, "co-payment": 5, "reimbursement": 5, "cashless": 5,
-    "pre-existing disease": 5, "waiting period": 5, "grace period": 5,
-
-    # High-value policy & admin terms (weight: 4)
-    "policy": 4, "insurer": 4, "insured": 4, "policyholder": 4, "proposer": 4,
-    "schedule": 4, "endorsement": 4, "renewal": 4, "cancellation": 4, "portability": 4,
-    "migration": 4, "cumulative bonus": 4, "room rent": 4, "annexure": 4, "tpa": 4,
-    "sub-limit": 4,
-
-    # Medical coverage terms (weight: 3)
-    "hospitalization": 3, "pre-hospitalisation": 3, "post-hospitalisation": 3,
-    "in-patient": 3, "day care": 3, "surgery": 3, "icu": 3, "operation theatre": 3,
-    "medical practitioner": 3, "medical expenses": 3, "diagnostics": 3,
-    "medication": 3, "consultation": 3, "emergency": 3, "modern treatment": 3,
-    "dental treatment": 3, "cataract": 3, "ambulance": 3, "ayush": 3,
-    "immunotherapy": 3, "chemotherapy": 3, "robotic surgery": 3, "stem cell therapy": 3,
-
-    # Condition & disease terms (weight: 2)
-    "illness": 2, "injury": 2, "congenital anomaly": 2, "chronic condition": 2,
-    "acute condition": 2, "aids": 2, "cancer": 2, "hernia": 2, "arthritis": 2,
-    "hydrocele": 2, "piles": 2, "diabetes": 2, "hypertension": 2, "ulcers": 2,
-
-    # Claims processing terms (weight: 2)
-    "settlement": 2, "notification": 2, "submission": 2, "supporting documents": 2,
-    "admissible": 2, "processing": 2, "approval": 2,
-
-    # Regulatory/legal terms (weight: 2)
-    "irdai": 2, "uin": 2, "declaration": 2, "disclosure": 2, "contract": 2,
-    "condition precedent": 2, "statutory": 2, "compliance": 2
-}
-
-
 def calculate_chunk_score(chunk: Document, cache_scores: bool = True) -> float:
     """Calculate relevance score for insurance document chunks using domain-specific keywords"""
     text = chunk.page_content.lower()
+    word_count = len(text.split())  # Added missing word_count calculation
 
     # Base score
     score = 0.0
@@ -495,6 +489,7 @@ async def load_insurance_pdf_enhanced(path_or_url: str, max_chunks: int = 100) -
             with open(file_path, "wb") as f:
                 f.write(response.content)
             temp_download = True
+            print(f"Downloaded PDF to temporary file: {file_path}")
     else:
         file_path = Path(path_or_url)
         if not file_path.exists():
@@ -502,10 +497,28 @@ async def load_insurance_pdf_enhanced(path_or_url: str, max_chunks: int = 100) -
 
     def enhanced_load():
         try:
+            print(f"Loading PDF from: {file_path}")
+            print(f"File exists: {file_path.exists()}")
+            print(f"File size: {file_path.stat().st_size if file_path.exists() else 'N/A'} bytes")
+
             loader = PyPDFLoader(str(file_path))
             raw_docs = loader.load()
+
+            print(f"Raw documents loaded: {len(raw_docs)}")
+            if raw_docs:
+                print(f"First document content length: {len(raw_docs[0].page_content)}")
+                print(f"First document preview: {raw_docs[0].page_content[:200]}...")
+
             if not raw_docs:
-                return []
+                raise Exception("PyPDFLoader returned no documents")
+
+            # Debug: Check content before filtering
+            print(f"Documents before filtering: {len(raw_docs)}")
+            for i, doc in enumerate(raw_docs[:3]):  # Check first 3 docs
+                content_len = len(doc.page_content.strip())
+                word_count = doc.page_content.strip().count(' ')
+                is_toc = _is_likely_toc_or_header(doc.page_content)
+                print(f"Doc {i}: length={content_len}, words={word_count}, is_toc={is_toc}")
 
             # Filter out pages with insufficient content
             filtered_docs = [
@@ -515,15 +528,31 @@ async def load_insurance_pdf_enhanced(path_or_url: str, max_chunks: int = 100) -
                 and not _is_likely_toc_or_header(doc.page_content)
             ]
 
+            print(f"Documents after filtering: {len(filtered_docs)}")
+
             if not filtered_docs:
-                return []
+                # If all docs were filtered out, try with more lenient criteria
+                print("All documents filtered out, trying lenient filtering...")
+                filtered_docs = [
+                    doc for doc in raw_docs
+                    if len(doc.page_content.strip()) > 50  # Much more lenient
+                    and doc.page_content.strip().count(' ') > 5
+                ]
+                print(f"Documents after lenient filtering: {len(filtered_docs)}")
+
+                if not filtered_docs:
+                    raise Exception("No valid content found in PDF after filtering")
 
             # Use section-aware splitter
             splitter = get_smart_splitter(len(filtered_docs))
             split_docs = splitter.split_documents(filtered_docs)
 
+            print(f"Documents after splitting: {len(split_docs)}")
+
             # Smart sampling instead of blind downsampling
             final_docs = smart_chunk_sampling(split_docs, max_chunks)
+
+            print(f"Final documents after sampling: {len(final_docs)}")
 
             return final_docs
 
@@ -541,6 +570,9 @@ async def load_insurance_pdf_enhanced(path_or_url: str, max_chunks: int = 100) -
             os.remove(file_path)
         except:
             pass
+
+    if not split_docs:
+        raise Exception("No content extracted from PDF")
 
     return split_docs
 
