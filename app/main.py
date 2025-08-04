@@ -106,6 +106,10 @@ async def run_query_ultra_fast(
         if cleanup_fn:
             background_tasks.add_task(cleanup_fn)
 
+        # Log questions and answers
+        for q, a in zip(request.questions, answers):
+            print(f"Question: {q}\nAnswer: {a}\n{'-' * 50}")
+
         return {
             "answers": answers
         }
