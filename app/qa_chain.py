@@ -306,7 +306,7 @@ async def get_ultra_fast_qa_chain(docs: List[Document], use_reranking: bool = Tr
         weaviate_client=weaviate_client,
         index_name=collection_name,
         k=k,
-        alpha=0.3,
+        alpha=0.5,
         use_reranking=use_reranking
     )
 
