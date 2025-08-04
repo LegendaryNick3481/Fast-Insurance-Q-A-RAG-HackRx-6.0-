@@ -1,64 +1,180 @@
 """
-Enhanced RAG utils for insurance documents - Section-aware chunking
-Addresses the core issues:
-1. Section-aware chunking with logical boundaries
-2. Smart sampling instead of aggressive downsampling
-3. Better separator hierarchy with regex-based section detection
-4. Preserves critical insurance document structure
+Enhanced RAG utils for insurance documents - Semantic Similarity approach
+Focuses on semantic similarity-based chunking and sampling for better relevance
 """
+
+import numpy as np
+from typing import List, Dict, Optional
+import asyncio
+import httpx
+import json
+import os
+import tempfile
+import traceback
+import re
+from pathlib import Path
+from collections import defaultdict
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from typing import List, Tuple, Dict, Optional
-from pathlib import Path
-import httpx
-import os
-import tempfile
-import asyncio
-import re
-import traceback  # Added missing import
 from starlette.concurrency import run_in_threadpool
-from collections import defaultdict
 
+# Environment setup
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 if not VOYAGE_API_KEY:
     raise ValueError("VOYAGE_API_KEY not found in environment")
 
-# Consolidated keyword weights for easier tuning and dynamic scoring
-KEYWORD_WEIGHTS = {
-    # Critical insurance terms (weight: 5)
-    "coverage": 5, "exclusion": 5, "sum insured": 5, "premium": 5, "claim": 5,
-    "deductible": 5, "co-payment": 5, "reimbursement": 5, "cashless": 5,
-    "pre-existing disease": 5, "waiting period": 5, "grace period": 5,
 
-    # High-value policy & admin terms (weight: 4)
-    "policy": 4, "insurer": 4, "insured": 4, "policyholder": 4, "proposer": 4,
-    "schedule": 4, "endorsement": 4, "renewal": 4, "cancellation": 4, "portability": 4,
-    "migration": 4, "cumulative bonus": 4, "room rent": 4, "annexure": 4, "tpa": 4,
-    "sub-limit": 4,
+async def get_embeddings(texts: List[str], model: str = "voyage-3.5-lite") -> List[List[float]]:
+    """Get embeddings from Voyage AI API"""
+    if not VOYAGE_API_KEY:
+        raise ValueError("VOYAGE_API_KEY not found in environment")
 
-    # Medical coverage terms (weight: 3)
-    "hospitalization": 3, "pre-hospitalisation": 3, "post-hospitalisation": 3,
-    "in-patient": 3, "day care": 3, "surgery": 3, "icu": 3, "operation theatre": 3,
-    "medical practitioner": 3, "medical expenses": 3, "diagnostics": 3,
-    "medication": 3, "consultation": 3, "emergency": 3, "modern treatment": 3,
-    "dental treatment": 3, "cataract": 3, "ambulance": 3, "ayush": 3,
-    "immunotherapy": 3, "chemotherapy": 3, "robotic surgery": 3, "stem cell therapy": 3,
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.voyageai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {VOYAGE_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "input": texts,
+                "model": model
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+        return [item["embedding"] for item in data["data"]]
 
-    # Condition & disease terms (weight: 2)
-    "illness": 2, "injury": 2, "congenital anomaly": 2, "chronic condition": 2,
-    "acute condition": 2, "aids": 2, "cancer": 2, "hernia": 2, "arthritis": 2,
-    "hydrocele": 2, "piles": 2, "diabetes": 2, "hypertension": 2, "ulcers": 2,
 
-    # Claims processing terms (weight: 2)
-    "settlement": 2, "notification": 2, "submission": 2, "supporting documents": 2,
-    "admissible": 2, "processing": 2, "approval": 2,
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors"""
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
 
-    # Regulatory/legal terms (weight: 2)
-    "irdai": 2, "uin": 2, "declaration": 2, "disclosure": 2, "contract": 2,
-    "condition precedent": 2, "statutory": 2, "compliance": 2
-}
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
+async def calculate_semantic_scores(chunks: List[Document], query: str = None) -> List[float]:
+    """Calculate semantic similarity scores for chunks"""
+
+    # If no query provided, use a generic business/document query
+    if not query:
+        query = "important terms conditions coverage benefits requirements procedures definitions"
+
+    # Prepare texts for embedding
+    chunk_texts = []
+    for chunk in chunks:
+        # Use first 500 chars to avoid token limits while preserving context
+        text = chunk.page_content[:500].strip()
+        if len(text) < 50:  # If too short, use full text
+            text = chunk.page_content.strip()
+        chunk_texts.append(text)
+
+    # Get embeddings for all chunks and query
+    all_texts = [query] + chunk_texts
+
+    try:
+        embeddings = await get_embeddings(all_texts)
+        query_embedding = embeddings[0]
+        chunk_embeddings = embeddings[1:]
+
+        # Calculate similarity scores
+        scores = []
+        for chunk_embedding in chunk_embeddings:
+            similarity = cosine_similarity(query_embedding, chunk_embedding)
+            scores.append(max(similarity, 0.0))  # Ensure non-negative
+
+        return scores
+
+    except Exception as e:
+        print(f"Error getting embeddings: {e}")
+        # Fallback to basic text length scoring
+        return [min(len(text.split()) / 100, 1.0) for text in chunk_texts]
+
+
+async def semantic_chunk_sampling(chunks: List[Document], max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Smart sampling based on semantic similarity"""
+
+    if len(chunks) <= max_chunks:
+        return chunks
+
+    print(f"Calculating semantic scores for {len(chunks)} chunks...")
+
+    # Get semantic similarity scores
+    semantic_scores = await calculate_semantic_scores(chunks, query)
+
+    # Combine chunks with their scores
+    scored_chunks = list(zip(chunks, semantic_scores))
+
+    # Group by section if available
+    section_groups = defaultdict(list)
+    standalone_chunks = []
+
+    for chunk, score in scored_chunks:
+        section_title = chunk.metadata.get('section_title', '')
+        if section_title:
+            section_groups[section_title].append((chunk, score))
+        else:
+            standalone_chunks.append((chunk, score))
+
+    selected_chunks = []
+
+    # Process sections - take top chunks from each section based on semantic score
+    if section_groups:
+        # Calculate average semantic score per section
+        section_avg_scores = []
+        for section_title, section_chunk_scores in section_groups.items():
+            avg_score = sum(score for _, score in section_chunk_scores) / len(section_chunk_scores)
+            section_avg_scores.append((section_title, avg_score, section_chunk_scores))
+
+        # Sort sections by average semantic relevance
+        section_avg_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Distribute chunks across semantically relevant sections
+        chunks_per_section = max(2, max_chunks // max(len(section_groups), 1))
+
+        for section_title, avg_score, section_chunk_scores in section_avg_scores:
+            # Sort chunks within section by semantic score
+            section_chunk_scores.sort(key=lambda x: x[1], reverse=True)
+
+            # Take top semantically similar chunks from this section
+            section_limit = min(len(section_chunk_scores), chunks_per_section)
+            selected_chunks.extend([chunk for chunk, score in section_chunk_scores[:section_limit]])
+
+            if len(selected_chunks) >= max_chunks:
+                break
+
+    # Add standalone chunks based on semantic relevance
+    remaining_slots = max_chunks - len(selected_chunks)
+    if remaining_slots > 0 and standalone_chunks:
+        standalone_chunks.sort(key=lambda x: x[1], reverse=True)
+        selected_chunks.extend([chunk for chunk, score in standalone_chunks[:remaining_slots]])
+
+    # Final selection if still over limit - keep highest semantic scores
+    if len(selected_chunks) > max_chunks:
+        # Re-score if needed
+        final_scores = []
+        for chunk in selected_chunks:
+            # Find the chunk's semantic score from our original scoring
+            for orig_chunk, score in scored_chunks:
+                if orig_chunk == chunk:
+                    final_scores.append((chunk, score))
+                    break
+
+        final_scores.sort(key=lambda x: x[1], reverse=True)
+        selected_chunks = [chunk for chunk, score in final_scores[:max_chunks]]
+
+    print(f"Selected {len(selected_chunks)} chunks based on semantic similarity")
+    return selected_chunks
 
 
 class InsuranceSectionSplitter:
@@ -73,8 +189,13 @@ class InsuranceSectionSplitter:
         r'^\s*Chapter\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',  # "Chapter 1: General Provisions"
     ]
 
-    # Critical insurance keywords that should stay together (updated to match KEYWORD_WEIGHTS)
-    CRITICAL_KEYWORDS = list(KEYWORD_WEIGHTS.keys())
+    # Critical insurance keywords that should stay together
+    CRITICAL_KEYWORDS = [
+        "coverage", "exclusion", "sum insured", "premium", "claim",
+        "deductible", "co-payment", "reimbursement", "cashless",
+        "pre-existing disease", "waiting period", "grace period",
+        "policy", "insurer", "insured", "policyholder", "hospitalization"
+    ]
 
     def __init__(self, chunk_size: int = 2500, chunk_overlap: int = 400):
         self.chunk_size = chunk_size
@@ -111,7 +232,7 @@ class InsuranceSectionSplitter:
 
         return chunks
 
-    def _identify_sections(self, text: str) -> List[Tuple[str, str, int]]:
+    def _identify_sections(self, text: str) -> List[tuple]:
         """Identify logical sections in insurance documents"""
         sections = []
         lines = text.split('\n')
@@ -210,26 +331,9 @@ class InsuranceSectionSplitter:
         return chunks
 
     def _has_sufficient_context(self, text: str) -> bool:
-        """Check if chunk has sufficient context for insurance queries"""
-        text_lower = text.lower()
-
-        # Must have minimum length and word count
-        if len(text.strip()) < 200 or len(text.split()) < 30:
-            return False
-
-        # Should contain at least one critical insurance term
-        has_insurance_context = any(
-            keyword in text_lower for keyword in self.CRITICAL_KEYWORDS
-        )
-
-        # Or should have substantive content (not just headers/footers)
-        has_substantive_content = (
-            text.count('.') >= 2 or  # Multiple sentences
-            text.count(',') >= 3 or   # Complex sentences
-            len([w for w in text.split() if len(w) > 6]) >= 10  # Complex vocabulary
-        )
-
-        return has_insurance_context or has_substantive_content
+        """Very lenient context check for semantic approach"""
+        # Let semantic similarity handle quality - just check it's not empty
+        return len(text.strip()) > 10 and len(text.split()) > 2
 
     def _fallback_split(self, document: Document) -> List[Document]:
         """Fallback splitting when no sections are detected"""
@@ -284,297 +388,9 @@ def get_smart_splitter(num_pages: int) -> InsuranceSectionSplitter:
     )
 
 
-def calculate_chunk_score(chunk: Document, cache_scores: bool = True) -> float:
-    """Calculate relevance score for insurance document chunks using domain-specific keywords"""
-    text = chunk.page_content.lower()
-    word_count = len(text.split())  # Added missing word_count calculation
-
-    # Base score
-    score = 0.0
-
-    # 1. Insurance keyword density (weight: 35%) - Increased for domain specificity
-
-    # Critical insurance terms (highest weight)
-    critical_keywords = [
-        'coverage', 'exclusion', 'sum insured', 'premium', 'claim',
-        'deductible', 'co-payment', 'sub-limit', 'reimbursement',
-        'cashless', 'pre-existing disease', 'waiting period', 'grace period'
-    ]
-
-    # High-value policy & admin terms
-    high_value_keywords = [
-        'policy', 'insurer', 'insured', 'policyholder', 'proposer',
-        'schedule', 'endorsement', 'renewal', 'cancellation', 'portability',
-        'migration', 'cumulative bonus', 'room rent', 'annexure', 'tpa'
-    ]
-
-    # Medical coverage terms
-    medical_keywords = [
-        'hospitalization', 'pre-hospitalisation', 'post-hospitalisation',
-        'in-patient', 'day care', 'surgery', 'icu', 'operation theatre',
-        'medical practitioner', 'medical expenses', 'diagnostics',
-        'medication', 'consultation', 'emergency', 'modern treatment',
-        'dental treatment', 'cataract', 'ambulance', 'ayush',
-        'immunotherapy', 'chemotherapy', 'robotic surgery', 'stem cell therapy'
-    ]
-
-    # Condition & disease terms
-    condition_keywords = [
-        'illness', 'injury', 'congenital anomaly', 'chronic condition',
-        'acute condition', 'aids', 'cancer', 'hernia', 'arthritis',
-        'hydrocele', 'piles', 'diabetes', 'hypertension', 'ulcers'
-    ]
-
-    # Claims processing terms
-    claims_keywords = [
-        'settlement', 'notification', 'submission', 'supporting documents',
-        'admissible', 'processing', 'approval'
-    ]
-
-    # Regulatory/legal terms
-    regulatory_keywords = [
-        'irdai', 'uin', 'declaration', 'disclosure', 'contract',
-        'condition precedent', 'statutory', 'compliance'
-    ]
-
-
-    # Calculate keyword scores with domain-specific weighting
-    critical_score = sum(5 for keyword in critical_keywords if keyword in text)
-    high_value_score = sum(3 for keyword in high_value_keywords if keyword in text)
-    medical_score = sum(2 for keyword in medical_keywords if keyword in text)
-    condition_score = sum(2 for keyword in condition_keywords if keyword in text)
-    claims_score = sum(2 for keyword in claims_keywords if keyword in text)
-    regulatory_score = sum(1 for keyword in regulatory_keywords if keyword in text)
-
-    total_keyword_score = (
-        critical_score + high_value_score + medical_score +
-        condition_score + claims_score + regulatory_score
-    )
-    score += min(total_keyword_score * 0.35, 4.0)  # Cap at 4.0, increased weight
-
-    # 2. Insurance-specific numeric content (weight: 25%)
-    numeric_patterns = [
-        r'\₹[\d,]+(?:\.\d{2})?',      # Rupee amounts
-        r'\$[\d,]+(?:\.\d{2})?',      # Dollar amounts
-        r'rs\.?\s*[\d,]+',            # Rs. amounts
-        r'\d+\s*lakhs?',              # Lakh amounts
-        r'\d+\s*crores?',             # Crore amounts
-        r'\d+%',                      # Percentages
-        r'\d{1,3}(?:,\d{3})*',       # Large numbers with commas
-        r'\d+\s*(?:days?|months?|years?)',  # Time periods
-        r'\d+\s*(?:times?|x)',        # Multipliers (like "4 times room rent")
-        r'age\s+\d+',                 # Age references
-        r'\d+\s*(?:year|yr)s?\s*(?:waiting|wait)', # Waiting periods
-    ]
-
-    numeric_matches = sum(len(re.findall(pattern, text)) for pattern in numeric_patterns)
-    score += min(numeric_matches * 0.25, 2.5)  # Cap at 2.5
-
-    # 3. Sentence structure complexity (weight: 20%)
-    sentences = re.split(r'[.!?]+', text)
-    complex_sentences = [
-        s for s in sentences
-        if len(s.split()) > 15 and (',' in s or ';' in s or ':' in s)
-    ]
-    structure_score = len(complex_sentences) / max(len(sentences), 1)
-    score += structure_score * 2.0  # Cap at 2.0
-
-    # 4. Section importance (weight: 15%) - Updated for insurance documents
-    section_title = chunk.metadata.get('section_title', '').lower()
-    priority_sections = [
-        'definition', 'coverage', 'exclusion', 'sum insured', 'premium',
-        'claim', 'benefit', 'condition', 'waiting period', 'co-payment',
-        'hospitalization', 'medical expenses', 'pre-existing', 'renewal',
-        'cancellation', 'schedule', 'annexure'
-    ]
-
-    if any(priority in section_title for priority in priority_sections):
-        score += 1.5
-
-    # 5. Optimized content length scoring using sigmoid (weight: 10%)
-    # Smooth reward around 300–400 words (optimal chunk size)
-    optimal_length = 350
-    length_deviation = abs(word_count - optimal_length)
-    length_bonus = 1 / (1 + length_deviation / 100)  # Sigmoid-like curve
-    score += length_bonus * 1.0
-
-    # Cache the score for reuse
-    final_score = round(score, 2)
-    if cache_scores:
-        chunk._cached_score = final_score
-
-    return final_score
-
-
-def smart_chunk_sampling(chunks: List[Document], max_chunks: int = 100) -> List[Document]:
-    """Smart sampling that preserves important sections with optimized scoring"""
-
-    if len(chunks) <= max_chunks:
-        return chunks
-
-    # Calculate scores for all chunks ONCE and cache them
-    scored_chunks = [(chunk, calculate_chunk_score(chunk, cache_scores=True)) for chunk in chunks]
-
-    # Group chunks by section
-    section_groups = defaultdict(list)
-    standalone_chunks = []
-
-    for chunk, score in scored_chunks:
-        section_title = chunk.metadata.get('section_title', '')
-        if section_title:
-            section_groups[section_title].append((chunk, score))
-        else:
-            standalone_chunks.append((chunk, score))
-
-    # Sort standalone chunks by score
-    standalone_chunks.sort(key=lambda x: x[1], reverse=True)
-
-    # Priority sections that should always be included - Updated for health insurance
-    priority_keywords = [
-        'definition', 'coverage', 'exclusion', 'sum insured', 'premium',
-        'claim', 'co-payment', 'waiting period', 'hospitalization',
-        'medical expenses', 'pre-existing', 'renewal', 'cancellation'
-    ]
-
-    selected_chunks = []
-
-    # First, include high-priority sections (sorted by score within sections)
-    for section_title, section_chunk_scores in section_groups.items():
-        section_chunk_scores.sort(key=lambda x: x[1], reverse=True)  # Sort by score
-
-        is_priority = any(keyword in section_title.lower()
-                         for keyword in priority_keywords)
-
-        if is_priority:
-            # Include top chunks from priority sections
-            max_from_section = min(len(section_chunk_scores),
-                                 max(3, max_chunks // len(section_groups)))
-            selected_chunks.extend([chunk for chunk, score in section_chunk_scores[:max_from_section]])
-        else:
-            # For non-priority sections, take only the highest scoring chunks
-            if len(section_chunk_scores) <= 2:
-                selected_chunks.extend([chunk for chunk, score in section_chunk_scores])
-            else:
-                # Take top 2 highest scoring chunks from non-priority sections
-                selected_chunks.extend([chunk for chunk, score in section_chunk_scores[:2]])
-
-    # Add highest scoring standalone chunks if we have room
-    remaining_slots = max_chunks - len(selected_chunks)
-    if remaining_slots > 0 and standalone_chunks:
-        selected_chunks.extend([chunk for chunk, score in standalone_chunks[:remaining_slots]])
-
-    # Final selection: if still over limit, use cached scores (no re-calculation)
-    if len(selected_chunks) > max_chunks:
-        # Use already calculated scores from the cached chunk objects
-        final_scored = [(chunk, getattr(chunk, '_cached_score', 0.0)) for chunk in selected_chunks]
-        final_scored.sort(key=lambda x: x[1], reverse=True)
-        selected_chunks = [chunk for chunk, score in final_scored[:max_chunks]]
-
-    return selected_chunks
-
-
-async def load_insurance_pdf_enhanced(path_or_url: str, max_chunks: int = 100) -> List[Document]:
-    """Enhanced PDF loading with section-aware chunking"""
-    temp_download = False
-
-    if path_or_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0),  # Longer timeout for large docs
-            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
-        ) as client:
-            response = await client.get(path_or_url, follow_redirects=True)
-            response.raise_for_status()
-
-            file_path = Path(tempfile.mkstemp(suffix=".pdf")[1])
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-            temp_download = True
-            print(f"Downloaded PDF to temporary file: {file_path}")
-    else:
-        file_path = Path(path_or_url)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-    def enhanced_load():
-        try:
-            print(f"Loading PDF from: {file_path}")
-            print(f"File exists: {file_path.exists()}")
-            print(f"File size: {file_path.stat().st_size if file_path.exists() else 'N/A'} bytes")
-
-            loader = PyPDFLoader(str(file_path))
-            raw_docs = loader.load()
-
-            print(f"Raw documents loaded: {len(raw_docs)}")
-            if raw_docs:
-                print(f"First document content length: {len(raw_docs[0].page_content)}")
-                print(f"First document preview: {raw_docs[0].page_content[:200]}...")
-
-            if not raw_docs:
-                raise Exception("PyPDFLoader returned no documents")
-
-            # Debug: Check content before filtering
-            print(f"Documents before filtering: {len(raw_docs)}")
-            for i, doc in enumerate(raw_docs[:3]):  # Check first 3 docs
-                content_len = len(doc.page_content.strip())
-                word_count = doc.page_content.strip().count(' ')
-                is_toc = _is_likely_toc_or_header(doc.page_content)
-                print(f"Doc {i}: length={content_len}, words={word_count}, is_toc={is_toc}")
-
-            # Filter out pages with insufficient content
-            filtered_docs = [
-                doc for doc in raw_docs
-                if len(doc.page_content.strip()) > 150
-                and doc.page_content.strip().count(' ') > 15
-                and not _is_likely_toc_or_header(doc.page_content)
-            ]
-
-            print(f"Documents after filtering: {len(filtered_docs)}")
-
-            if not filtered_docs:
-                # If all docs were filtered out, try with more lenient criteria
-                print("All documents filtered out, trying lenient filtering...")
-                filtered_docs = [
-                    doc for doc in raw_docs
-                    if len(doc.page_content.strip()) > 50  # Much more lenient
-                    and doc.page_content.strip().count(' ') > 5
-                ]
-                print(f"Documents after lenient filtering: {len(filtered_docs)}")
-
-                if not filtered_docs:
-                    raise Exception("No valid content found in PDF after filtering")
-
-            # Use section-aware splitter
-            splitter = get_smart_splitter(len(filtered_docs))
-            split_docs = splitter.split_documents(filtered_docs)
-
-            print(f"Documents after splitting: {len(split_docs)}")
-
-            # Smart sampling instead of blind downsampling
-            final_docs = smart_chunk_sampling(split_docs, max_chunks)
-
-            print(f"Final documents after sampling: {len(final_docs)}")
-
-            return final_docs
-
-        except Exception as e:
-            # Enhanced error logging with full traceback
-            error_details = traceback.format_exc()
-            print(f"Error processing PDF {file_path}: {e}")
-            print(f"Full traceback:\n{error_details}")
-            raise Exception(f"PDF processing failed for {file_path}: {str(e)}") from e
-
-    split_docs = await run_in_threadpool(enhanced_load)
-
-    if temp_download and file_path.exists():
-        try:
-            os.remove(file_path)
-        except:
-            pass
-
-    if not split_docs:
-        raise Exception("No content extracted from PDF")
-
-    return split_docs
+def has_sufficient_context_semantic(text: str) -> bool:
+    """Very lenient context check - let semantic similarity handle quality"""
+    return len(text.strip()) > 10 and len(text.split()) > 2
 
 
 def _is_likely_toc_or_header(text: str) -> bool:
@@ -605,6 +421,102 @@ def _is_likely_toc_or_header(text: str) -> bool:
     return False
 
 
+async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Enhanced PDF loading with semantic similarity-based chunking"""
+    temp_download = False
+
+    if path_or_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        ) as client:
+            response = await client.get(path_or_url, follow_redirects=True)
+            response.raise_for_status()
+
+            file_path = Path(tempfile.mkstemp(suffix=".pdf")[1])
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            temp_download = True
+            print(f"Downloaded PDF to temporary file: {file_path}")
+    else:
+        file_path = Path(path_or_url)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+    def load_and_split():
+        try:
+            print(f"Loading PDF from: {file_path}")
+
+            loader = PyPDFLoader(str(file_path))
+            raw_docs = loader.load()
+
+            print(f"Raw documents loaded: {len(raw_docs)}")
+
+            if not raw_docs:
+                raise Exception("PyPDFLoader returned no documents")
+
+            # Very minimal filtering - only remove completely empty pages
+            filtered_docs = [
+                doc for doc in raw_docs
+                if len(doc.page_content.strip()) > 20  # Very lenient - just non-empty
+                and doc.page_content.strip().count(' ') > 3  # At least a few words
+            ]
+
+            print(f"Documents after minimal filtering: {len(filtered_docs)}")
+
+            # If still no docs, use all raw docs (let semantic similarity handle quality)
+            if not filtered_docs:
+                print("Using all raw documents - semantic similarity will handle quality")
+                filtered_docs = raw_docs
+
+            # Use section-aware splitter for better chunking
+            splitter = get_smart_splitter(len(filtered_docs))
+            split_docs = splitter.split_documents(filtered_docs)
+
+            print(f"Documents after splitting: {len(split_docs)}")
+
+            # Additional filtering for semantic approach
+            semantic_filtered = [
+                doc for doc in split_docs
+                if has_sufficient_context_semantic(doc.page_content)
+            ]
+
+            print(f"Documents after semantic filtering: {len(semantic_filtered)}")
+            return semantic_filtered
+
+        except Exception as e:
+            error_details = traceback.format_exc()
+            print(f"Error processing PDF {file_path}: {e}")
+            print(f"Full traceback:\n{error_details}")
+            raise Exception(f"PDF processing failed for {file_path}: {str(e)}") from e
+
+    split_docs = await run_in_threadpool(load_and_split)
+
+    if temp_download and file_path.exists():
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+    if not split_docs:
+        raise Exception("No content extracted from PDF")
+
+    # Apply semantic similarity-based sampling
+    final_docs = await semantic_chunk_sampling(split_docs, max_chunks, query)
+
+    return final_docs
+
+
+# Main API functions with consistent naming
+async def load_pdf_ultra_fast(path_or_url: str, query: str = None) -> List[Document]:
+    """Ultra fast PDF loading with semantic similarity - main API function"""
+    return await load_insurance_pdf_semantic(path_or_url, max_chunks=100, query=query)
+
+async def load_pdf_semantic(path_or_url: str, query: str = None) -> List[Document]:
+    """Semantic similarity-based PDF loading - alternative API"""
+    return await load_insurance_pdf_semantic(path_or_url, max_chunks=100, query=query)
+
+
 def cleanup_temp_files(*file_paths):
     """Clean up temporary files"""
     for path in file_paths:
@@ -613,9 +525,3 @@ def cleanup_temp_files(*file_paths):
                 os.remove(path)
             except:
                 pass
-
-
-# Backward compatibility - replace the old function
-async def load_pdf_ultra_fast(path_or_url: str) -> List[Document]:
-    """Backward compatible function - now uses enhanced processing"""
-    return await load_insurance_pdf_enhanced(path_or_url, max_chunks=100)
