@@ -20,10 +20,39 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from starlette.concurrency import run_in_threadpool
 
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
 # Environment setup
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 if not VOYAGE_API_KEY:
     raise ValueError("VOYAGE_API_KEY not found in environment")
+
+
+def extract_pdf_preview(file_path: str) -> str:
+    """Extract first 50 words from PDF for preview"""
+    if not PyPDF2:
+        return "PyPDF2 not available"
+
+    try:
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+
+            if len(pdf_reader.pages) > 0:
+                first_page_text = pdf_reader.pages[0].extract_text()
+
+                # Clean up the text and get first 50 words
+                words = first_page_text.strip().split()
+                preview_words = words[:50] if len(words) >= 50 else words
+
+                return ' '.join(preview_words) + ('...' if len(words) > 50 else '')
+
+        return "Could not extract preview"
+
+    except Exception:
+        return "Could not extract preview"
 
 
 async def get_embeddings(texts: List[str], model: str = "voyage-3.5-lite") -> List[List[float]]:
@@ -96,7 +125,6 @@ async def calculate_semantic_scores(chunks: List[Document], query: str = None) -
         return scores
 
     except Exception as e:
-        print(f"Error getting embeddings: {e}")
         # Fallback to basic text length scoring
         return [min(len(text.split()) / 100, 1.0) for text in chunk_texts]
 
@@ -106,8 +134,6 @@ async def semantic_chunk_sampling(chunks: List[Document], max_chunks: int = 100,
 
     if len(chunks) <= max_chunks:
         return chunks
-
-    print(f"Calculating semantic scores for {len(chunks)} chunks...")
 
     # Get semantic similarity scores
     semantic_scores = await calculate_semantic_scores(chunks, query)
@@ -173,7 +199,6 @@ async def semantic_chunk_sampling(chunks: List[Document], max_chunks: int = 100,
         final_scores.sort(key=lambda x: x[1], reverse=True)
         selected_chunks = [chunk for chunk, score in final_scores[:max_chunks]]
 
-    print(f"Selected {len(selected_chunks)} chunks based on semantic similarity")
     return selected_chunks
 
 
@@ -425,7 +450,10 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
     """Enhanced PDF loading with semantic similarity-based chunking"""
     temp_download = False
 
+    # Print URL if it's a remote document
     if path_or_url.startswith(("http://", "https://")):
+        print(f"Processing document from URL: {path_or_url}")
+
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0),
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
@@ -437,20 +465,19 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
             with open(file_path, "wb") as f:
                 f.write(response.content)
             temp_download = True
-            print(f"Downloaded PDF to temporary file: {file_path}")
     else:
         file_path = Path(path_or_url)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
+    # Extract and print document preview from PDF content
+    doc_preview = await run_in_threadpool(extract_pdf_preview, str(file_path))
+    print(f"Document preview: {doc_preview}")
+
     def load_and_split():
         try:
-            print(f"Loading PDF from: {file_path}")
-
             loader = PyPDFLoader(str(file_path))
             raw_docs = loader.load()
-
-            print(f"Raw documents loaded: {len(raw_docs)}")
 
             if not raw_docs:
                 raise Exception("PyPDFLoader returned no documents")
@@ -462,18 +489,13 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
                 and doc.page_content.strip().count(' ') > 3  # At least a few words
             ]
 
-            print(f"Documents after minimal filtering: {len(filtered_docs)}")
-
             # If still no docs, use all raw docs (let semantic similarity handle quality)
             if not filtered_docs:
-                print("Using all raw documents - semantic similarity will handle quality")
                 filtered_docs = raw_docs
 
             # Use section-aware splitter for better chunking
             splitter = get_smart_splitter(len(filtered_docs))
             split_docs = splitter.split_documents(filtered_docs)
-
-            print(f"Documents after splitting: {len(split_docs)}")
 
             # Additional filtering for semantic approach
             semantic_filtered = [
@@ -481,13 +503,10 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
                 if has_sufficient_context_semantic(doc.page_content)
             ]
 
-            print(f"Documents after semantic filtering: {len(semantic_filtered)}")
             return semantic_filtered
 
         except Exception as e:
             error_details = traceback.format_exc()
-            print(f"Error processing PDF {file_path}: {e}")
-            print(f"Full traceback:\n{error_details}")
             raise Exception(f"PDF processing failed for {file_path}: {str(e)}") from e
 
     split_docs = await run_in_threadpool(load_and_split)

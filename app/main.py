@@ -106,9 +106,12 @@ async def run_query_ultra_fast(
         if cleanup_fn:
             background_tasks.add_task(cleanup_fn)
 
-        # Log questions and answers
-        for q, a in zip(request.questions, answers):
-            print(f"Question: {q}\nAnswer: {a}\n{'-' * 50}")
+        # Group all questions and answers into separate dicts
+        questions_dict = {f"q{i + 1}": q for i, q in enumerate(request.questions)}
+        answers_dict = {f"a{i + 1}": a for i, a in enumerate(answers)}
+
+        print("Questions:", questions_dict)
+        print("Answers:", answers_dict)
 
         return {
             "answers": answers
