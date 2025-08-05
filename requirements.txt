@@ -1,3 +1,4 @@
+PyPDF2==3.0.1
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.15
 aiolimiter==1.2.1
