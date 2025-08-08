@@ -1,10 +1,10 @@
 """
 Enhanced RAG utils for insurance documents - Semantic Similarity approach
-Focuses on semantic similarity-based chunking and sampling for better relevance
+Supports PDF, DOCX, and Email processing with semantic similarity-based chunking
 """
 
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 import asyncio
 import httpx
 import json
@@ -14,8 +14,13 @@ import traceback
 import re
 from pathlib import Path
 from collections import defaultdict
+import email
+import mimetypes
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders.word_document import Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from starlette.concurrency import run_in_threadpool
@@ -24,6 +29,19 @@ try:
     import PyPDF2
 except ImportError:
     PyPDF2 = None
+
+try:
+    import docx2txt
+except ImportError:
+    docx2txt = None
+
+try:
+    from python_docx import Document as DocxDocument
+except ImportError:
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        DocxDocument = None
 
 # Environment setup
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
@@ -55,7 +73,109 @@ def extract_pdf_preview(file_path: str) -> str:
         return "Could not extract preview"
 
 
-async def get_embeddings(texts: List[str], model: str = "voyage-3.5-lite") -> List[List[float]]:
+def extract_docx_preview(file_path: str) -> str:
+    """Extract first 50 words from DOCX for preview"""
+    try:
+        if docx2txt:
+            # Try with docx2txt first (simpler)
+            text = docx2txt.process(file_path)
+            if text:
+                words = text.strip().split()
+                preview_words = words[:50] if len(words) >= 50 else words
+                return ' '.join(preview_words) + ('...' if len(words) > 50 else '')
+
+        if DocxDocument:
+            # Fallback to python-docx
+            doc = DocxDocument(file_path)
+            text = ""
+            for paragraph in doc.paragraphs[:5]:  # First 5 paragraphs
+                text += paragraph.text + " "
+
+            words = text.strip().split()
+            preview_words = words[:50] if len(words) >= 50 else words
+            return ' '.join(preview_words) + ('...' if len(words) > 50 else '')
+
+        return "DOCX processing libraries not available"
+
+    except Exception as e:
+        return f"Could not extract preview: {str(e)}"
+
+
+def extract_email_preview(email_content: str) -> str:
+    """Extract preview from email content"""
+    try:
+        # Parse email
+        msg = email.message_from_string(email_content)
+
+        # Get subject and sender info
+        subject = msg.get('subject', 'No Subject')
+        sender = msg.get('from', 'Unknown Sender')
+
+        # Get body content
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    body = part.get_payload(decode=True)
+                    if isinstance(body, bytes):
+                        body = body.decode('utf-8', errors='ignore')
+                    break
+        else:
+            body = msg.get_payload(decode=True)
+            if isinstance(body, bytes):
+                body = body.decode('utf-8', errors='ignore')
+
+        # Create preview
+        preview_text = f"From: {sender} | Subject: {subject}"
+        if body:
+            body_words = body.strip().split()[:30]  # First 30 words of body
+            if body_words:
+                preview_text += f" | Content: {' '.join(body_words)}"
+                if len(body.split()) > 30:
+                    preview_text += "..."
+
+        return preview_text
+
+    except Exception as e:
+        return f"Could not extract email preview: {str(e)}"
+
+
+def detect_file_type(file_path: str) -> str:
+    """Detect file type based on extension and content"""
+    file_path = Path(file_path)
+    extension = file_path.suffix.lower()
+
+    if extension == '.pdf':
+        return 'pdf'
+    elif extension in ['.docx', '.doc']:
+        return 'docx'
+    elif extension in ['.eml', '.msg']:
+        return 'email'
+    elif extension == '.txt':
+        # Check if it's an email file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read(1000)  # Read first 1000 chars
+                if any(header in content.lower() for header in ['from:', 'to:', 'subject:', 'date:']):
+                    return 'email'
+        except:
+            pass
+        return 'text'
+    else:
+        # Try to detect based on content
+        mime_type, _ = mimetypes.guess_type(str(file_path))
+        if mime_type:
+            if 'pdf' in mime_type:
+                return 'pdf'
+            elif 'word' in mime_type or 'officedocument' in mime_type:
+                return 'docx'
+            elif 'text' in mime_type:
+                return 'text'
+
+        return 'unknown'
+
+
+async def get_embeddings(texts: List[str], model: str = "voyage-3-large") -> List[List[float]]:
     """Get embeddings from Voyage AI API"""
     if not VOYAGE_API_KEY:
         raise ValueError("VOYAGE_API_KEY not found in environment")
@@ -202,29 +322,33 @@ async def semantic_chunk_sampling(chunks: List[Document], max_chunks: int = 100,
     return selected_chunks
 
 
-class InsuranceSectionSplitter:
-    """Custom splitter that understands insurance document structure"""
+class UniversalDocumentSplitter:
+    """Universal splitter that handles PDF, DOCX, and Email documents"""
 
-    # Common insurance section patterns
-    SECTION_PATTERNS = [
-        r'^\s*(?:SECTION\s+)?([IVXLCDM]+|\d+)\.\s*([A-Z][A-Z\s&-]+)(?:\s*[-–—]\s*)?',  # "1. DEFINITIONS" or "I. COVERAGE"
-        r'^\s*([A-Z][A-Z\s&-]{10,})\s*$',  # All caps headers like "GENERAL CONDITIONS"
-        r'^\s*Part\s+([IVXLCDM]+|\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',  # "Part I: Liability Coverage"
-        r'^\s*Article\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',  # "Article 1: Definitions"
-        r'^\s*Chapter\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',  # "Chapter 1: General Provisions"
-    ]
+    # Common section patterns for different document types
+    SECTION_PATTERNS = {
+        'insurance': [
+            r'^\s*(?:SECTION\s+)?([IVXLCDM]+|\d+)\.\s*([A-Z][A-Z\s&-]+)(?:\s*[-–—]\s*)?',
+            r'^\s*([A-Z][A-Z\s&-]{10,})\s*$',
+            r'^\s*Part\s+([IVXLCDM]+|\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',
+            r'^\s*Article\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',
+            r'^\s*Chapter\s+(\d+)[\s:]?\s*([A-Z][A-Za-z\s&-]+)',
+        ],
+        'email': [
+            r'^(From|To|Cc|Bcc|Subject|Date):\s*(.+)',
+            r'^[-=_]{3,}\s*$',  # Email separators
+            r'^>\s*(.+)',  # Quoted text
+        ],
+        'general': [
+            r'^\s*([A-Z][A-Za-z\s&-]{5,})\s*$',  # General headers
+            r'^\s*\d+\.\s*([A-Z][A-Za-z\s&-]+)',  # Numbered sections
+        ]
+    }
 
-    # Critical insurance keywords that should stay together
-    CRITICAL_KEYWORDS = [
-        "coverage", "exclusion", "sum insured", "premium", "claim",
-        "deductible", "co-payment", "reimbursement", "cashless",
-        "pre-existing disease", "waiting period", "grace period",
-        "policy", "insurer", "insured", "policyholder", "hospitalization"
-    ]
-
-    def __init__(self, chunk_size: int = 2500, chunk_overlap: int = 400):
+    def __init__(self, chunk_size: int = 2500, chunk_overlap: int = 400, doc_type: str = 'general'):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.doc_type = doc_type
 
     def split_documents(self, documents: List[Document]) -> List[Document]:
         """Split documents while preserving section boundaries"""
@@ -237,28 +361,103 @@ class InsuranceSectionSplitter:
         return all_chunks
 
     def _split_single_document(self, document: Document) -> List[Document]:
-        """Split a single document preserving insurance sections"""
+        """Split a single document preserving sections based on document type"""
         text = document.page_content
-        sections = self._identify_sections(text)
+        doc_type = document.metadata.get('doc_type', self.doc_type)
 
-        if not sections:
-            # Fallback to regular splitting if no sections found
-            return self._fallback_split(document)
+        if doc_type == 'email':
+            return self._split_email_document(document)
+        else:
+            sections = self._identify_sections(text, doc_type)
 
+            if not sections:
+                return self._fallback_split(document)
+
+            chunks = []
+            for section_title, section_text, start_pos in sections:
+                section_chunks = self._split_section(
+                    section_text,
+                    section_title,
+                    document.metadata,
+                    start_pos
+                )
+                chunks.extend(section_chunks)
+
+            return chunks
+
+    def _split_email_document(self, document: Document) -> List[Document]:
+        """Special handling for email documents"""
+        text = document.page_content
+
+        # Parse email structure
+        lines = text.split('\n')
+        headers = {}
+        body_start = 0
+
+        # Extract headers
+        for i, line in enumerate(lines):
+            if ':' in line and i < 20:  # Check first 20 lines for headers
+                key, value = line.split(':', 1)
+                if key.strip().lower() in ['from', 'to', 'subject', 'date', 'cc', 'bcc']:
+                    headers[key.strip().lower()] = value.strip()
+                    body_start = i + 1
+
+        # Get body
+        body_lines = lines[body_start:]
+        body = '\n'.join(body_lines)
+
+        # Create chunks
         chunks = []
-        for section_title, section_text, start_pos in sections:
-            section_chunks = self._split_section(
-                section_text,
-                section_title,
-                document.metadata,
-                start_pos
-            )
-            chunks.extend(section_chunks)
+
+        # Header chunk
+        if headers:
+            header_text = "Email Headers:\n"
+            for key, value in headers.items():
+                header_text += f"{key.title()}: {value}\n"
+
+            metadata = document.metadata.copy()
+            metadata.update({
+                'section_title': 'Email Headers',
+                'chunk_type': 'email_headers',
+                **headers
+            })
+            chunks.append(Document(page_content=header_text, metadata=metadata))
+
+        # Body chunks
+        if body.strip():
+            if len(body) <= self.chunk_size:
+                # Small body - keep as one chunk
+                metadata = document.metadata.copy()
+                metadata.update({
+                    'section_title': 'Email Body',
+                    'chunk_type': 'email_body',
+                    **headers
+                })
+                chunks.append(Document(page_content=body, metadata=metadata))
+            else:
+                # Split large body
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+                body_chunks = splitter.split_text(body)
+
+                for i, chunk_text in enumerate(body_chunks):
+                    metadata = document.metadata.copy()
+                    metadata.update({
+                        'section_title': f'Email Body Part {i+1}',
+                        'chunk_type': 'email_body',
+                        'chunk_index': i,
+                        **headers
+                    })
+                    chunks.append(Document(page_content=chunk_text, metadata=metadata))
 
         return chunks
 
-    def _identify_sections(self, text: str) -> List[tuple]:
-        """Identify logical sections in insurance documents"""
+    def _identify_sections(self, text: str, doc_type: str) -> List[tuple]:
+        """Identify logical sections based on document type"""
+        patterns = self.SECTION_PATTERNS.get(doc_type, self.SECTION_PATTERNS['general'])
+
         sections = []
         lines = text.split('\n')
         current_section = []
@@ -266,11 +465,10 @@ class InsuranceSectionSplitter:
         section_start = 0
 
         for i, line in enumerate(lines):
-            # Check if this line is a section header
             is_header = False
             title = ""
 
-            for pattern in self.SECTION_PATTERNS:
+            for pattern in patterns:
                 match = re.match(pattern, line.strip())
                 if match:
                     is_header = True
@@ -278,12 +476,10 @@ class InsuranceSectionSplitter:
                     break
 
             if is_header and current_section:
-                # Save previous section
                 section_text = '\n'.join(current_section)
-                if len(section_text.strip()) > 100:  # Only keep substantial sections
+                if len(section_text.strip()) > 50:
                     sections.append((current_title, section_text, section_start))
 
-                # Start new section
                 current_section = [line]
                 current_title = title
                 section_start = i
@@ -293,7 +489,7 @@ class InsuranceSectionSplitter:
         # Add final section
         if current_section:
             section_text = '\n'.join(current_section)
-            if len(section_text.strip()) > 100:
+            if len(section_text.strip()) > 50:
                 sections.append((current_title, section_text, section_start))
 
         return sections
@@ -310,23 +506,19 @@ class InsuranceSectionSplitter:
                 'section_start': start_pos,
                 'chunk_type': 'complete_section'
             })
-            # Add section title as header for better LLM context
             enhanced_content = f"{section_title}\n\n{section_text}" if section_title else section_text
             return [Document(page_content=enhanced_content, metadata=metadata)]
 
-        # Split larger sections using insurance-aware approach
-        chunks = []
-
-        # Use custom separators that respect insurance document structure
+        # Split larger sections
         separators = [
-            r'\n\s*(?:\([a-z]\)|\([0-9]+\)|\([IVXLCDM]+\))',  # Subsection markers like (a), (1), (i)
-            r'\n\s*[a-z]\.\s+',  # List items like "a. "
-            r'\n\s*\d+\.\s+',    # Numbered items like "1. "
-            r'(?<=[.!?])\s+(?=[A-Z])',  # Sentence boundaries
-            r'\n\n+',            # Paragraph breaks
-            r'\n',               # Line breaks
-            r'\.\s+',            # Sentence endings
-            r'\s+'               # Word boundaries (last resort)
+            r'\n\s*(?:\([a-z]\)|\([0-9]+\)|\([IVXLCDM]+\))',
+            r'\n\s*[a-z]\.\s+',
+            r'\n\s*\d+\.\s+',
+            r'(?<=[.!?])\s+(?=[A-Z])',
+            r'\n\n+',
+            r'\n',
+            r'\.\s+',
+            r'\s+'
         ]
 
         splitter = RecursiveCharacterTextSplitter(
@@ -338,9 +530,9 @@ class InsuranceSectionSplitter:
         )
 
         section_chunks = splitter.split_text(section_text)
+        chunks = []
 
         for i, chunk_text in enumerate(section_chunks):
-            # Ensure chunk contains enough context
             if self._has_sufficient_context(chunk_text):
                 metadata = base_metadata.copy()
                 metadata.update({
@@ -349,37 +541,24 @@ class InsuranceSectionSplitter:
                     'chunk_index': i,
                     'chunk_type': 'section_part'
                 })
-                # Add section title as header for better LLM context
                 enhanced_content = f"{section_title}\n\n{chunk_text}" if section_title else chunk_text
                 chunks.append(Document(page_content=enhanced_content, metadata=metadata))
 
         return chunks
 
     def _has_sufficient_context(self, text: str) -> bool:
-        """Very lenient context check for semantic approach"""
-        # Let semantic similarity handle quality - just check it's not empty
+        """Check if chunk has sufficient context"""
         return len(text.strip()) > 10 and len(text.split()) > 2
 
     def _fallback_split(self, document: Document) -> List[Document]:
         """Fallback splitting when no sections are detected"""
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            separators=[
-                r'\n\n\n+',
-                r'\n\n',
-                r'(?<=[.!?])\s+(?=[A-Z])',
-                r'\n',
-                r'\.\s+',
-                r'\s+'
-            ],
-            length_function=len,
-            is_separator_regex=True,
+            chunk_overlap=self.chunk_overlap
         )
 
         chunks = splitter.split_documents([document])
 
-        # Filter and enhance metadata
         filtered_chunks = []
         for i, chunk in enumerate(chunks):
             if self._has_sufficient_context(chunk.page_content):
@@ -392,67 +571,262 @@ class InsuranceSectionSplitter:
         return filtered_chunks
 
 
-def get_smart_splitter(num_pages: int) -> InsuranceSectionSplitter:
-    """Get section-aware splitter with page-based sizing"""
-    if num_pages > 300:
+def load_docx_document(file_path: str) -> List[Document]:
+    """Load DOCX document using available libraries"""
+    try:
+        if docx2txt:
+            # Try docx2txt first (simpler and more reliable)
+            text = docx2txt.process(file_path)
+            if text and text.strip():
+                metadata = {
+                    'source': file_path,
+                    'doc_type': 'docx',
+                    'loader': 'docx2txt'
+                }
+                return [Document(page_content=text, metadata=metadata)]
+
+        # Try Langchain's Docx2txtLoader
+        try:
+            loader = Docx2txtLoader(file_path)
+            docs = loader.load()
+            if docs:
+                for doc in docs:
+                    doc.metadata.update({'doc_type': 'docx', 'loader': 'langchain_docx2txt'})
+                return docs
+        except Exception:
+            pass
+
+        # Fallback to python-docx if available
+        if DocxDocument:
+            doc = DocxDocument(file_path)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+
+            if text.strip():
+                metadata = {
+                    'source': file_path,
+                    'doc_type': 'docx',
+                    'loader': 'python_docx'
+                }
+                return [Document(page_content=text, metadata=metadata)]
+
+        raise Exception("No DOCX processing library available")
+
+    except Exception as e:
+        raise Exception(f"Failed to load DOCX: {str(e)}")
+
+
+def load_email_document(file_path: str) -> List[Document]:
+    """Load email document (.eml, .msg, or text file with email content)"""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        # Try to parse as email
+        try:
+            msg = email.message_from_string(content)
+
+            # Extract metadata
+            metadata = {
+                'source': file_path,
+                'doc_type': 'email',
+                'subject': msg.get('subject', ''),
+                'from': msg.get('from', ''),
+                'to': msg.get('to', ''),
+                'date': msg.get('date', ''),
+                'loader': 'email_parser'
+            }
+
+            # Get full email content (headers + body)
+            full_content = content
+
+            return [Document(page_content=full_content, metadata=metadata)]
+
+        except Exception:
+            # If email parsing fails, treat as plain text with email markers
+            if any(marker in content.lower() for marker in ['from:', 'to:', 'subject:']):
+                metadata = {
+                    'source': file_path,
+                    'doc_type': 'email',
+                    'loader': 'text_email'
+                }
+                return [Document(page_content=content, metadata=metadata)]
+            else:
+                raise Exception("File doesn't appear to contain email content")
+
+    except Exception as e:
+        raise Exception(f"Failed to load email: {str(e)}")
+
+
+def get_smart_splitter(content_length: int, doc_type: str = 'general') -> UniversalDocumentSplitter:
+    """Get document splitter with size-based parameters"""
+    if content_length > 100000:  # Very large documents
         chunk_size, chunk_overlap = 3500, 500
-    elif num_pages > 150:
+    elif content_length > 50000:
         chunk_size, chunk_overlap = 3000, 400
-    elif num_pages > 75:
+    elif content_length > 25000:
         chunk_size, chunk_overlap = 2500, 350
-    elif num_pages > 40:
+    elif content_length > 10000:
         chunk_size, chunk_overlap = 2000, 300
-    elif num_pages > 20:
+    elif content_length > 5000:
         chunk_size, chunk_overlap = 1800, 250
     else:
         chunk_size, chunk_overlap = 1500, 200
 
-    return InsuranceSectionSplitter(
+    return UniversalDocumentSplitter(
         chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
+        chunk_overlap=chunk_overlap,
+        doc_type=doc_type
     )
 
 
-def has_sufficient_context_semantic(text: str) -> bool:
-    """Very lenient context check - let semantic similarity handle quality"""
-    return len(text.strip()) > 10 and len(text.split()) > 2
+async def load_document_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Universal document loading with semantic similarity-based chunking"""
+    temp_download = False
+    file_path = None
+
+    try:
+        # Handle URL downloads
+        if path_or_url.startswith(("http://", "https://")):
+            print(f"Processing document from URL: {path_or_url}")
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0),
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
+            ) as client:
+                response = await client.get(path_or_url, follow_redirects=True)
+                response.raise_for_status()
+
+                # Determine file extension from URL or Content-Type
+                content_type = response.headers.get('content-type', '').lower()
+                if 'pdf' in content_type:
+                    extension = '.pdf'
+                elif 'word' in content_type or 'officedocument' in content_type:
+                    extension = '.docx'
+                else:
+                    # Try to get from URL
+                    url_path = Path(path_or_url)
+                    extension = url_path.suffix or '.txt'
+
+                file_path = Path(tempfile.mkstemp(suffix=extension)[1])
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+                temp_download = True
+        else:
+            file_path = Path(path_or_url)
+            if not file_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Detect file type
+        file_type = detect_file_type(str(file_path))
+        print(f"Detected file type: {file_type}")
+
+        def load_and_split():
+            try:
+                # Load document based on type
+                if file_type == 'pdf':
+                    loader = PyPDFLoader(str(file_path))
+                    raw_docs = loader.load()
+                    doc_type = 'insurance'  # Assume insurance for PDFs
+
+                    # Extract and print preview
+                    preview = extract_pdf_preview(str(file_path))
+                    print(f"Document preview: {preview}")
+
+                elif file_type == 'docx':
+                    raw_docs = load_docx_document(str(file_path))
+                    doc_type = 'general'
+
+                    # Extract and print preview
+                    preview = extract_docx_preview(str(file_path))
+                    print(f"Document preview: {preview}")
+
+                elif file_type == 'email':
+                    raw_docs = load_email_document(str(file_path))
+                    doc_type = 'email'
+
+                    # Extract and print preview
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        email_content = f.read()
+                    preview = extract_email_preview(email_content)
+                    print(f"Email preview: {preview}")
+
+                else:
+                    # Fallback to text loading
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+
+                    metadata = {'source': str(file_path), 'doc_type': 'text'}
+                    raw_docs = [Document(page_content=content, metadata=metadata)]
+                    doc_type = 'general'
+
+                    words = content.strip().split()[:50]
+                    preview = ' '.join(words) + ('...' if len(content.split()) > 50 else '')
+                    print(f"Document preview: {preview}")
+
+                if not raw_docs:
+                    raise Exception(f"No content extracted from {file_type} file")
+
+                # Update metadata with document type
+                for doc in raw_docs:
+                    doc.metadata['doc_type'] = doc_type
+
+                # Filter minimal content
+                filtered_docs = [
+                    doc for doc in raw_docs
+                    if len(doc.page_content.strip()) > 20
+                    and doc.page_content.strip().count(' ') > 3
+                ]
+
+                if not filtered_docs:
+                    filtered_docs = raw_docs
+
+                # Calculate total content length for smart splitting
+                total_length = sum(len(doc.page_content) for doc in filtered_docs)
+
+                # Use universal splitter
+                splitter = get_smart_splitter(total_length, doc_type)
+                split_docs = splitter.split_documents(filtered_docs)
+
+                # Filter chunks
+                semantic_filtered = [
+                    doc for doc in split_docs
+                    if len(doc.page_content.strip()) > 10 and len(doc.page_content.split()) > 2
+                ]
+
+                return semantic_filtered
+
+            except Exception as e:
+                error_details = traceback.format_exc()
+                raise Exception(f"Document processing failed for {file_path}: {str(e)}") from e
+
+        split_docs = await run_in_threadpool(load_and_split)
+
+        if not split_docs:
+            raise Exception("No content extracted from document")
+
+        # Apply semantic similarity-based sampling
+        final_docs = await semantic_chunk_sampling(split_docs, max_chunks, query)
+
+        return final_docs
+
+    finally:
+        # Clean up temporary files
+        if temp_download and file_path and file_path.exists():
+            try:
+                os.remove(file_path)
+            except:
+                pass
 
 
-def _is_likely_toc_or_header(text: str) -> bool:
-    """Detect and filter table of contents or header/footer pages"""
-    text_lower = text.lower().strip()
-
-    # Check for table of contents indicators
-    toc_indicators = [
-        'table of contents', 'contents', 'index',
-        'page', 'section', '..........', '......'
-    ]
-
-    # Check if it's mostly page numbers and dots
-    lines = text.split('\n')
-    numeric_lines = sum(1 for line in lines if re.search(r'\d+\s*$', line.strip()))
-
-    if numeric_lines > len(lines) * 0.5:  # More than 50% lines end with numbers
-        return True
-
-    # Check for TOC keywords
-    if any(indicator in text_lower for indicator in toc_indicators):
-        return True
-
-    # Very short pages are likely headers/footers
-    if len(text.split()) < 20:
-        return True
-
-    return False
-
-
-async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
-    """Enhanced PDF loading with semantic similarity-based chunking"""
+# Specific loader functions for different document types
+async def load_pdf_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Load PDF with semantic similarity-based chunking"""
     temp_download = False
 
-    # Print URL if it's a remote document
     if path_or_url.startswith(("http://", "https://")):
-        print(f"Processing document from URL: {path_or_url}")
+        print(f"Processing PDF from URL: {path_or_url}")
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0),
@@ -468,11 +842,11 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
     else:
         file_path = Path(path_or_url)
         if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise FileNotFoundError(f"PDF file not found: {file_path}")
 
-    # Extract and print document preview from PDF content
+    # Extract and print document preview
     doc_preview = await run_in_threadpool(extract_pdf_preview, str(file_path))
-    print(f"Document preview: {doc_preview}")
+    print(f"PDF preview: {doc_preview}")
 
     def load_and_split():
         try:
@@ -482,25 +856,29 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
             if not raw_docs:
                 raise Exception("PyPDFLoader returned no documents")
 
-            # Very minimal filtering - only remove completely empty pages
+            # Update metadata
+            for doc in raw_docs:
+                doc.metadata['doc_type'] = 'insurance'
+
+            # Filter documents
             filtered_docs = [
                 doc for doc in raw_docs
-                if len(doc.page_content.strip()) > 20  # Very lenient - just non-empty
-                and doc.page_content.strip().count(' ') > 3  # At least a few words
+                if len(doc.page_content.strip()) > 20
+                and doc.page_content.strip().count(' ') > 3
             ]
 
-            # If still no docs, use all raw docs (let semantic similarity handle quality)
             if not filtered_docs:
                 filtered_docs = raw_docs
 
-            # Use section-aware splitter for better chunking
-            splitter = get_smart_splitter(len(filtered_docs))
+            # Use section-aware splitter
+            total_length = sum(len(doc.page_content) for doc in filtered_docs)
+            splitter = get_smart_splitter(total_length, 'insurance')
             split_docs = splitter.split_documents(filtered_docs)
 
-            # Additional filtering for semantic approach
+            # Filter chunks
             semantic_filtered = [
                 doc for doc in split_docs
-                if has_sufficient_context_semantic(doc.page_content)
+                if len(doc.page_content.strip()) > 10 and len(doc.page_content.split()) > 2
             ]
 
             return semantic_filtered
@@ -522,18 +900,162 @@ async def load_insurance_pdf_semantic(path_or_url: str, max_chunks: int = 100, q
 
     # Apply semantic similarity-based sampling
     final_docs = await semantic_chunk_sampling(split_docs, max_chunks, query)
-
     return final_docs
 
 
-# Main API functions with consistent naming
+async def load_docx_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Load DOCX with semantic similarity-based chunking"""
+    temp_download = False
+
+    if path_or_url.startswith(("http://", "https://")):
+        print(f"Processing DOCX from URL: {path_or_url}")
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        ) as client:
+            response = await client.get(path_or_url, follow_redirects=True)
+            response.raise_for_status()
+
+            file_path = Path(tempfile.mkstemp(suffix=".docx")[1])
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            temp_download = True
+    else:
+        file_path = Path(path_or_url)
+        if not file_path.exists():
+            raise FileNotFoundError(f"DOCX file not found: {file_path}")
+
+    # Extract and print document preview
+    doc_preview = await run_in_threadpool(extract_docx_preview, str(file_path))
+    print(f"DOCX preview: {doc_preview}")
+
+    def load_and_split():
+        try:
+            raw_docs = load_docx_document(str(file_path))
+
+            if not raw_docs:
+                raise Exception("No content extracted from DOCX")
+
+            # Update metadata
+            for doc in raw_docs:
+                doc.metadata['doc_type'] = 'general'
+
+            # Calculate total length and use appropriate splitter
+            total_length = sum(len(doc.page_content) for doc in raw_docs)
+            splitter = get_smart_splitter(total_length, 'general')
+            split_docs = splitter.split_documents(raw_docs)
+
+            # Filter chunks
+            semantic_filtered = [
+                doc for doc in split_docs
+                if len(doc.page_content.strip()) > 10 and len(doc.page_content.split()) > 2
+            ]
+
+            return semantic_filtered
+
+        except Exception as e:
+            error_details = traceback.format_exc()
+            raise Exception(f"DOCX processing failed for {file_path}: {str(e)}") from e
+
+    split_docs = await run_in_threadpool(load_and_split)
+
+    if temp_download and file_path.exists():
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+    if not split_docs:
+        raise Exception("No content extracted from DOCX")
+
+    # Apply semantic similarity-based sampling
+    final_docs = await semantic_chunk_sampling(split_docs, max_chunks, query)
+    return final_docs
+
+
+async def load_email_semantic(path_or_url: str, max_chunks: int = 100, query: str = None) -> List[Document]:
+    """Load Email with semantic similarity-based chunking"""
+    temp_download = False
+
+    if path_or_url.startswith(("http://", "https://")):
+        print(f"Processing Email from URL: {path_or_url}")
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        ) as client:
+            response = await client.get(path_or_url, follow_redirects=True)
+            response.raise_for_status()
+
+            file_path = Path(tempfile.mkstemp(suffix=".eml")[1])
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            temp_download = True
+    else:
+        file_path = Path(path_or_url)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Email file not found: {file_path}")
+
+    # Extract and print email preview
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        email_content = f.read()
+    doc_preview = extract_email_preview(email_content)
+    print(f"Email preview: {doc_preview}")
+
+    def load_and_split():
+        try:
+            raw_docs = load_email_document(str(file_path))
+
+            if not raw_docs:
+                raise Exception("No content extracted from email")
+
+            # Update metadata
+            for doc in raw_docs:
+                doc.metadata['doc_type'] = 'email'
+
+            # Calculate total length and use appropriate splitter
+            total_length = sum(len(doc.page_content) for doc in raw_docs)
+            splitter = get_smart_splitter(total_length, 'email')
+            split_docs = splitter.split_documents(raw_docs)
+
+            # Filter chunks
+            semantic_filtered = [
+                doc for doc in split_docs
+                if len(doc.page_content.strip()) > 10 and len(doc.page_content.split()) > 2
+            ]
+
+            return semantic_filtered
+
+        except Exception as e:
+            error_details = traceback.format_exc()
+            raise Exception(f"Email processing failed for {file_path}: {str(e)}") from e
+
+    split_docs = await run_in_threadpool(load_and_split)
+
+    if temp_download and file_path.exists():
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+    if not split_docs:
+        raise Exception("No content extracted from email")
+
+    # Apply semantic similarity-based sampling
+    final_docs = await semantic_chunk_sampling(split_docs, max_chunks, query)
+    return final_docs
+
+
+# Main API functions
 async def load_pdf_ultra_fast(path_or_url: str, query: str = None) -> List[Document]:
     """Ultra fast PDF loading with semantic similarity - main API function"""
-    return await load_insurance_pdf_semantic(path_or_url, max_chunks=100, query=query)
+    return await load_pdf_semantic(path_or_url, max_chunks=100, query=query)
 
-async def load_pdf_semantic(path_or_url: str, query: str = None) -> List[Document]:
-    """Semantic similarity-based PDF loading - alternative API"""
-    return await load_insurance_pdf_semantic(path_or_url, max_chunks=100, query=query)
+
+async def load_document_ultra_fast(path_or_url: str, query: str = None) -> List[Document]:
+    """Ultra fast universal document loading - main API function"""
+    return await load_document_semantic(path_or_url, max_chunks=100, query=query)
 
 
 def cleanup_temp_files(*file_paths):
@@ -544,3 +1066,96 @@ def cleanup_temp_files(*file_paths):
                 os.remove(path)
             except:
                 pass
+
+
+# Additional utility functions
+def validate_environment():
+    """Validate that required environment variables and libraries are available"""
+    issues = []
+
+    # Check API key
+    if not VOYAGE_API_KEY:
+        issues.append("VOYAGE_API_KEY environment variable not set")
+
+    # Check libraries
+    if not PyPDF2:
+        issues.append("PyPDF2 library not available - PDF processing may be limited")
+
+    if not docx2txt and not DocxDocument:
+        issues.append("No DOCX processing library available (docx2txt or python-docx)")
+
+    if issues:
+        print("Environment validation issues:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return False
+
+    return True
+
+
+def get_supported_formats():
+    """Get list of supported document formats"""
+    formats = ['PDF']
+
+    if docx2txt or DocxDocument:
+        formats.append('DOCX')
+
+    formats.extend(['Email (.eml)', 'Text files'])
+
+    return formats
+
+
+async def batch_load_documents(file_paths: List[str], max_chunks_per_doc: int = 50,
+                              query: str = None) -> Dict[str, List[Document]]:
+    """Load multiple documents in batch"""
+    results = {}
+
+    for file_path in file_paths:
+        try:
+            print(f"Processing: {file_path}")
+            docs = await load_document_semantic(file_path, max_chunks_per_doc, query)
+            results[file_path] = docs
+            print(f"Successfully loaded {len(docs)} chunks from {file_path}")
+        except Exception as e:
+            print(f"Failed to load {file_path}: {str(e)}")
+            results[file_path] = []
+
+    return results
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    import asyncio
+
+    async def test_example():
+        """Example usage of the enhanced RAG utils"""
+
+        # Validate environment
+        if not validate_environment():
+            print("Please install required libraries and set environment variables")
+            return
+
+        print("Supported formats:", get_supported_formats())
+
+        # Example file paths (replace with actual files)
+        test_files = [
+            "example.pdf",
+            "example.docx",
+            "example.eml"
+        ]
+
+        # Test universal loader
+        for file_path in test_files:
+            if os.path.exists(file_path):
+                try:
+                    print(f"\n--- Testing {file_path} ---")
+                    docs = await load_document_ultra_fast(file_path, query="insurance coverage")
+                    print(f"Loaded {len(docs)} chunks")
+
+                    # Show first chunk
+                    if docs:
+                        print(f"First chunk preview: {docs[0].page_content[:200]}...")
+                        print(f"Metadata: {docs[0].metadata}")
+
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")

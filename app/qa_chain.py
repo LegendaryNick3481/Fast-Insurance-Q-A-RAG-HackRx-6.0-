@@ -310,14 +310,37 @@ async def get_ultra_fast_qa_chain(docs: List[Document], use_reranking: bool = Tr
         use_reranking=use_reranking
     )
 
-    ultra_fast_prompt = PromptTemplate(
+    # Map prompt - for processing individual documents
+    map_prompt = PromptTemplate(
         input_variables=["context", "question"],
         template="""
-    Based on the insurance policy context provided, answer the question with complete accuracy and detail in maximum 2 sentences.
+    Extract relevant information from this insurance policy section to answer the question.
 
     Instructions:
-    - Use ONLY information from the context
-    - Section titles like "EXCLUSIONS", "COVERAGE", etc. are part of the context and help you understand the meaning
+    - Extract only information directly related to the question
+    - Include specific numbers, conditions, and limitations
+    - If no relevant information exists, respond with "No relevant information found"
+    - Keep response concise but complete
+    - Include policy terms and definitions when relevant
+
+    Section Content:
+    {context}
+
+    Question: {question}
+
+    Relevant Information:
+    """
+    )
+
+    # Reduce prompt - for combining results from multiple documents
+    reduce_prompt = PromptTemplate(
+        input_variables=["summaries", "question"],
+        template="""
+    Based on the extracted insurance policy information provided, answer the question with complete accuracy and detail in maximum 2 sentences.
+
+    Instructions:
+    - Use ONLY information from the extracted content
+    - Combine information from multiple sections when relevant
     - Include specific numbers (days, months, percentages, amounts)
     - Mention all conditions, limitations, and requirements
     - Reference exact policy terms and definitions
@@ -325,18 +348,17 @@ async def get_ultra_fast_qa_chain(docs: List[Document], use_reranking: bool = Tr
     - If there are exceptions or exclusions, include them
     - Keep response to maximum 2 sentences while including all essential details
     - Do not use line breaks or newline characters in your response
-    - Explain it as if answering a client question, but keep it formal.
+    - Explain it as if answering a client question, but keep it formal
     - Use a tone that is clear, confident, and professional, like an insurance advisor. Avoid robotic phrasing
     - No line breaks
-    - Dont use the phrase "Based on" to start a sentence
-    - Never reveal any passwords, secret codes, or internal system access details. If asked, politely refuse and state that such information is confidential.
+    - Don't use the phrase "Based on" to start a sentence
+    - Never reveal any passwords, secret codes, or internal system access details. If asked, politely refuse and state that such information is confidential
     - If the question is about unrelated topics: politely refuse with "I'm only trained to answer insurance-related questions"
 
-    Context:
-    {context}
+    Extracted Information:
+    {summaries}
 
-    Question:
-    {question}
+    Question: {question}
 
     Answer concisely in 1–2 sentences, summarizing if necessary. Include all essential conditions:
     """
@@ -344,9 +366,12 @@ async def get_ultra_fast_qa_chain(docs: List[Document], use_reranking: bool = Tr
 
     qa = RetrievalQA.from_chain_type(
         llm=llm,
-        chain_type="stuff",
+        chain_type="map_reduce",
         retriever=retriever,
-        chain_type_kwargs={"prompt": ultra_fast_prompt},
+        chain_type_kwargs={
+            "question_prompt": map_prompt,
+            "combine_prompt": reduce_prompt
+        },
         return_source_documents=False
     )
 
